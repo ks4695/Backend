@@ -68,7 +68,7 @@ let memorySessions = null;  // { token: { email, name, createdAt } }
 const otpStore = new Map(); // 이메일 인증코드 임시 저장 — 수명이 짧아(10분) 파일 저장 불필요
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+const model = genAI.getGenerativeModel({ model: 'gemini-3.6-flash' });
 
 // ============================================================
 // Token 관리
