@@ -645,7 +645,12 @@ async function fetchExcelFromOneDrive() {
     return allMappedData;
 
   } catch (error) {
-    console.error('❌ OneDrive 읽기 실패:', error.response?.data || error.message);
+    // 응답이 Buffer(arraybuffer)로 오면 사람이 읽을 수 있게 문자열로 풀어서 출력
+    let errDetail = error.response?.data || error.message;
+    if (Buffer.isBuffer(errDetail)) {
+      try { errDetail = errDetail.toString('utf8'); } catch (e) { /* 무시 */ }
+    }
+    console.error('❌ OneDrive 읽기 실패:', errDetail);
     // ✨ 매우 중요: 절대로 빈 배열을 반환하면 안 된다.
     //    과거에 여기서 조용히 []를 반환했던 것이, 호출부(add-part, AI챗봇 재고수정 등)가
     //    이를 "실제로 재고가 텅 빈 상태"로 착각하게 만들어 updateExcelOnOneDrive()가
@@ -2314,6 +2319,36 @@ ${realFacilities.join(', ')}
           }
         }
 
+        // ✨ 입고는 바로 반영하지 않고, 화면에서 "실제 재고와 동일한지" 확인을 받은 뒤
+        //    /api/ai/confirm-receive 로 반영한다. (출고는 기존대로 즉시 처리)
+        if (action === '입고') {
+          const pendingItems = [];
+          const notFound = [];
+          for (const item of items) {
+            const cands = findCandidates(item.모델명);
+            const qty = Math.floor(Number(item.수량) || 0);
+            if (cands.length === 0) { notFound.push(item.모델명); continue; }
+            if (qty <= 0) continue;
+            pendingItems.push({
+              모델명: cands[0].모델명,
+              수량: qty,
+              현재수량: Number(cands[0].현재수량) || 0,
+              이후수량: (Number(cands[0].현재수량) || 0) + qty
+            });
+          }
+          if (pendingItems.length === 0) {
+            return res.json({ success: true, message: `⚠️ 요청하신 부품을 재고에서 찾지 못해 반영되지 않았습니다. 모델명을 다시 확인해 주세요.`, inventoryUpdated: false, updateResult: null, timestamp: new Date().toISOString() });
+          }
+          const nfMsg = notFound.length ? `\n(찾지 못한 부품: ${notFound.join(', ')})` : '';
+          return res.json({
+            success: true,
+            message: `입고 전 실제 재고 확인이 필요합니다.${nfMsg}`,
+            inventoryUpdated: false, updateResult: null,
+            pendingReceive: { items: pendingItems },
+            timestamp: new Date().toISOString()
+          });
+        }
+
         let updatedCount = 0;
         for (const item of items) {
           const candidates = findCandidates(item.모델명);
@@ -2371,6 +2406,58 @@ ${realFacilities.join(', ')}
   } catch (error) {
     console.error('❌ AI 채팅 에러:', error.message);
     res.status(500).json({ success: false, message: 'AI 응답 오류' });
+  }
+});
+
+// ============================================================
+// ✨ AI 챗봇 입고 확정 — 사용자가 "실제 재고와 동일함"을 확인한 뒤에만 호출됨
+// ============================================================
+app.post('/api/ai/confirm-receive', requireAuth, async (req, res) => {
+  try {
+    const { items, user } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: '입고 항목이 없습니다.' });
+    }
+    invalidateCache();
+    const data = await fetchExcelFromOneDrive();
+    const norm = (v) => String(v || '').replace(/\s+/g, '').toLowerCase();
+
+    // 1) 전부 검증 (그 사이 다른 사람이 수량을 바꿨으면 중단)
+    const plan = [];
+    for (const it of items) {
+      const target = data.find(d => norm(d.모델명) === norm(it.모델명));
+      const qty = Math.floor(Number(it.수량) || 0);
+      if (!target || qty <= 0) {
+        return res.status(400).json({ success: false, message: `${it.모델명}: 입고할 수 없는 항목입니다.` });
+      }
+      if (Number(target.현재수량) !== Number(it.현재수량)) {
+        return res.status(409).json({ success: false, message: `${target.모델명}: 확인 중에 재고가 ${target.현재수량}개로 바뀌었습니다. 다시 요청해 주세요.` });
+      }
+      plan.push({ target, qty });
+    }
+
+    // 2) 반영 (로그 먼저 → 엑셀 저장, 실패 시 롤백)
+    const done = [];
+    for (const { target, qty } of plan) {
+      const oldQty = target.현재수량;
+      target.현재수량 = oldQty + qty;
+      target.최종수정시각 = getKSTDate();
+      target.작업자 = user || 'AI 어시스턴트';
+      const logId = uuidv4();
+      addLog('입고', target, qty, user || 'AI 어시스턴트', logId);
+      addFacilityLog('입고', target, qty, user || 'AI 어시스턴트', logId);
+      done.push({ target, oldQty, logId });
+    }
+    const success = await updateExcelOnOneDrive(data);
+    if (!success) {
+      done.forEach(d => { removeLogsById(d.logId); d.target.현재수량 = d.oldQty; });
+      return res.status(500).json({ success: false, message: 'OneDrive 업데이트 실패' });
+    }
+    checkAndNotifyLowStock(data);
+    res.json({ success: true, items: plan.map(p => ({ 모델명: p.target.모델명, 수량: p.qty })) });
+  } catch (error) {
+    console.error('❌ confirm-receive 에러:', error.message);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
